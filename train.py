@@ -4,6 +4,8 @@ from __future__ import absolute_import
 
 import os
 
+from model.dataset import TrainDataProvider
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 if type(tf.contrib) != type(tf): tf.contrib._warning = None
@@ -50,34 +52,54 @@ args = parser.parse_args()
 def main(_):
     hvd.init()
     config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    config.gpu_options.visible_device_list = str(hvd.local_rank())
+    # config.gpu_options.allow_growth = True
+    # config.gpu_options.visible_device_list = str(hvd.local_rank())
+    model = UNet(args.experiment_dir, batch_size=args.batch_size, experiment_id=args.experiment_id,
+                    input_width=args.image_size, output_width=args.image_size, embedding_num=args.embedding_num,
+                    embedding_dim=args.embedding_dim, L1_penalty=args.L1_penalty, Lconst_penalty=args.Lconst_penalty,
+                    Ltv_penalty=args.Ltv_penalty, Lcategory_penalty=args.Lcategory_penalty)
+    if args.flip_labels:
+        model.build_model(is_training=True, inst_norm=args.inst_norm, no_target_source=True)
+    else:
+        model.build_model(is_training=True, inst_norm=args.inst_norm)
 
-    global_step = tf.train.get_or_create_global_step()
+    # global_step = tf.train.get_or_create_global_step()
     hooks = [
         hvd.BroadcastGlobalVariablesHook(0),
-        tf.train.LoggingTensorHook(tensors={'step': global_step}, every_n_iter=100),
     ]
-    checkpoint_dir = './checkpoints' if hvd.rank() == 0 else None
+    # checkpoint_dir = './checkpoints' if hvd.rank() == 0 else None
 
     # with tf.Session(config=config) as sess:
-    with tf.train.MonitoredTrainingSession(checkpoint_dir=checkpoint_dir,
+    lr = args.lr
+    fine_tune_list = None
+    if args.fine_tune:
+        ids = args.fine_tune.split(",")
+        fine_tune_list = set([int(i) for i in ids])
+
+    # filter by one type of labels
+    data_provider = TrainDataProvider(model.data_dir, filter_by=fine_tune_list)
+    total_batches = data_provider.compute_total_batch_num(model.batch_size)
+    val_batch_iter = data_provider.get_val_iter(model.batch_size)
+
+    g_vars, d_vars = model.retrieve_trainable_vars(freeze_encoder=args.freeze_encoder)
+    input_handle, loss_handle, _, summary_handle = model.retrieve_handles()
+    learning_rate = tf.placeholder(tf.float32, name="learning_rate")
+    d_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5)
+    d_op = d_optimizer.minimize(loss_handle.d_loss, var_list=d_vars)
+    g_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5)
+    g_op = g_optimizer.minimize(loss_handle.g_loss, var_list=g_vars)
+
+    d_optimizer = hvd.DistributedOptimizer(d_optimizer)
+    g_optimizer = hvd.DistributedOptimizer(g_optimizer)
+
+    with tf.train.MonitoredTrainingSession(
                                            config=config,
                                            hooks=hooks) as sess:
-        model = UNet(args.experiment_dir, batch_size=args.batch_size, experiment_id=args.experiment_id,
-                     input_width=args.image_size, output_width=args.image_size, embedding_num=args.embedding_num,
-                     embedding_dim=args.embedding_dim, L1_penalty=args.L1_penalty, Lconst_penalty=args.Lconst_penalty,
-                     Ltv_penalty=args.Ltv_penalty, Lcategory_penalty=args.Lcategory_penalty)
         model.register_session(sess)
-        if args.flip_labels:
-            model.build_model(is_training=True, inst_norm=args.inst_norm, no_target_source=True)
-        else:
-            model.build_model(is_training=True, inst_norm=args.inst_norm)
-        fine_tune_list = None
-        if args.fine_tune:
-            ids = args.fine_tune.split(",")
-            fine_tune_list = set([int(i) for i in ids])
-        model.train(lr=args.lr, epoch=args.epoch, resume=args.resume,
+        model.train(d_op=d_op, g_op=g_op, input_handle=input_handle, loss_handle=loss_handle,
+                    summary_handle=summary_handle, data_provider=data_provider,
+                    total_batches=total_batches, val_batch_iter=val_batch_iter, learning_rate=learning_rate,
+                    lr=args.lr, epoch=args.epoch, resume=args.resume,
                     schedule=args.schedule, freeze_encoder=args.freeze_encoder, fine_tune=fine_tune_list,
                     sample_steps=args.sample_steps, checkpoint_steps=args.checkpoint_steps,
                     flip_labels=args.flip_labels)

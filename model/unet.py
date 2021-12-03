@@ -505,20 +505,13 @@ class UNet(object):
             op = tf.assign(var, val, validate_shape=False)
             self.sess.run(op)
 
-    def train(self, lr=0.0002, epoch=100, schedule=10, resume=True, flip_labels=False,
+    def train(self, d_op, g_op, input_handle, loss_handle, summary_handle, data_provider,
+                    total_batches, val_batch_iter, learning_rate,
+              lr, epoch=100, schedule=10, resume=True, flip_labels=False,
               freeze_encoder=False, fine_tune=None, sample_steps=50, checkpoint_steps=500):
-        g_vars, d_vars = self.retrieve_trainable_vars(freeze_encoder=freeze_encoder)
-        input_handle, loss_handle, _, summary_handle = self.retrieve_handles()
 
         if not self.sess:
             raise Exception("no session registered")
-
-        learning_rate = tf.placeholder(tf.float32, name="learning_rate")
-        d_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5).minimize(loss_handle.d_loss, var_list=d_vars)
-        g_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5).minimize(loss_handle.g_loss, var_list=g_vars)
-
-        d_optimizer = hvd.DistributedOptimizer(d_optimizer)
-        g_optimizer = hvd.DistributedOptimizer(g_optimizer)
 
         # tf.global_variables_initializer().run()
         real_data = input_handle.real_data
@@ -526,10 +519,6 @@ class UNet(object):
         no_target_data = input_handle.no_target_data
         no_target_ids = input_handle.no_target_ids
 
-        # filter by one type of labels
-        data_provider = TrainDataProvider(self.data_dir, filter_by=fine_tune)
-        total_batches = data_provider.compute_total_batch_num(self.batch_size)
-        val_batch_iter = data_provider.get_val_iter(self.batch_size)
 
         # saver = tf.train.Saver(max_to_keep=3)
         # summary_writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
@@ -561,7 +550,7 @@ class UNet(object):
                     if flip_labels:
                         np.random.shuffle(shuffled_ids)
                     # Optimize D
-                    _, batch_d_loss, d_summary = self.sess.run([d_optimizer, loss_handle.d_loss,
+                    _, batch_d_loss, d_summary = self.sess.run([d_op, loss_handle.d_loss,
                                                                 summary_handle.d_merged],
                                                             feed_dict={
                                                                 real_data: batch_images,
@@ -571,7 +560,7 @@ class UNet(object):
                                                                 no_target_ids: shuffled_ids
                                                             })
                     # Optimize G
-                    _, batch_g_loss = self.sess.run([g_optimizer, loss_handle.g_loss],
+                    _, batch_g_loss = self.sess.run([g_op, loss_handle.g_loss],
                                                     feed_dict={
                                                         real_data: batch_images,
                                                         embedding_ids: labels,
@@ -583,7 +572,7 @@ class UNet(object):
                     # according to https://github.com/carpedm20/DCGAN-tensorflow
                     # collect all the losses along the way
                     _, batch_g_loss, category_loss, cheat_loss, \
-                    const_loss, l1_loss, tv_loss, g_summary = self.sess.run([g_optimizer,
+                    const_loss, l1_loss, tv_loss, g_summary = self.sess.run([g_op,
                                                                             loss_handle.g_loss,
                                                                             loss_handle.category_loss,
                                                                             loss_handle.cheat_loss,

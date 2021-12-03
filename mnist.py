@@ -151,8 +151,8 @@ def main(_):
 
     # Horovod: pin GPU to be used to process local rank (one GPU per process)
     config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    config.gpu_options.visible_device_list = str(hvd.local_rank())
+    # config.gpu_options.allow_growth = True
+    # config.gpu_options.visible_device_list = str(hvd.local_rank())
 
     # Horovod: save checkpoints only on worker 0 to prevent other workers from
     # corrupting them.
