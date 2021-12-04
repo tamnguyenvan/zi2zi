@@ -519,13 +519,13 @@ class UNet(object):
         no_target_data = input_handle.no_target_data
         no_target_ids = input_handle.no_target_ids
 
+        # if hvd.rank() == 0:
+        #     saver = tf.train.Saver(max_to_keep=3)
+        #     summary_writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
 
-        # saver = tf.train.Saver(max_to_keep=3)
-        # summary_writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
-
-        # if resume:
-        #     _, model_dir = self.get_model_id_and_dir()
-        #     self.restore_model(saver, model_dir)
+        #     if resume:
+        #         _, model_dir = self.get_model_id_and_dir()
+        #         self.restore_model(saver, model_dir)
 
         current_lr = lr
         counter = 0
@@ -593,18 +593,19 @@ class UNet(object):
                                     "category_loss: %.5f, cheat_loss: %.5f, const_loss: %.5f, l1_loss: %.5f, tv_loss: %.5f"
                         print(log_format % (ei, bid, total_batches, passed, batch_d_loss, batch_g_loss,
                                             category_loss, cheat_loss, const_loss, l1_loss, tv_loss))
-                        summary_writer.add_summary(d_summary, counter)
-                        summary_writer.add_summary(g_summary, counter)
+                        # summary_writer.add_summary(d_summary, counter)
+                        # summary_writer.add_summary(g_summary, counter)
 
                     if counter % sample_steps == 0:
                         # sample the current model states with val data
-                        self.validate_model(val_batch_iter, ei, counter)
+                        if hvd.rank() == 0:
+                            self.validate_model(val_batch_iter, ei, counter)
 
-                    if counter % checkpoint_steps == 0:
-                        if hvd.rankd() == 0:
-                            print("Checkpoint: save checkpoint step %d" % counter)
-                            self.checkpoint(saver, counter)
+                    # if counter % checkpoint_steps == 0:
+                    #     if hvd.rankd() == 0:
+                    #         print("Checkpoint: save checkpoint step %d" % counter)
+                    #         self.checkpoint(saver, counter)
             # save the last checkpoint
-            if hvd.rank() == 0:
-                print("Checkpoint: last checkpoint step %d" % counter)
-                self.checkpoint(saver, counter)
+            # if hvd.rank() == 0:
+            #     print("Checkpoint: last checkpoint step %d" % counter)
+            #     self.checkpoint(saver, counter)

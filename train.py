@@ -52,8 +52,8 @@ args = parser.parse_args()
 def main(_):
     hvd.init()
     config = tf.ConfigProto()
-    # config.gpu_options.allow_growth = True
-    # config.gpu_options.visible_device_list = str(hvd.local_rank())
+    config.gpu_options.allow_growth = True
+    config.gpu_options.visible_device_list = str(hvd.local_rank())
     model = UNet(args.experiment_dir, batch_size=args.batch_size, experiment_id=args.experiment_id,
                     input_width=args.image_size, output_width=args.image_size, embedding_num=args.embedding_num,
                     embedding_dim=args.embedding_dim, L1_penalty=args.L1_penalty, Lconst_penalty=args.Lconst_penalty,
@@ -67,9 +67,7 @@ def main(_):
     hooks = [
         hvd.BroadcastGlobalVariablesHook(0),
     ]
-    # checkpoint_dir = './checkpoints' if hvd.rank() == 0 else None
 
-    # with tf.Session(config=config) as sess:
     lr = args.lr
     fine_tune_list = None
     if args.fine_tune:
@@ -81,20 +79,25 @@ def main(_):
     total_batches = data_provider.compute_total_batch_num(model.batch_size)
     val_batch_iter = data_provider.get_val_iter(model.batch_size)
 
+    global_step = tf.train.get_or_create_global_step()
     g_vars, d_vars = model.retrieve_trainable_vars(freeze_encoder=args.freeze_encoder)
     input_handle, loss_handle, _, summary_handle = model.retrieve_handles()
     learning_rate = tf.placeholder(tf.float32, name="learning_rate")
     d_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5)
-    d_op = d_optimizer.minimize(loss_handle.d_loss, var_list=d_vars)
+    d_op = d_optimizer.minimize(loss_handle.d_loss, var_list=d_vars, global_step=global_step)
     g_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5)
-    g_op = g_optimizer.minimize(loss_handle.g_loss, var_list=g_vars)
+    g_op = g_optimizer.minimize(loss_handle.g_loss, var_list=g_vars, global_step=global_step)
 
     d_optimizer = hvd.DistributedOptimizer(d_optimizer)
     g_optimizer = hvd.DistributedOptimizer(g_optimizer)
 
-    with tf.train.MonitoredTrainingSession(
+    checkpoint_dir = model.checkpoint_dir if hvd.rank() == 0 else None
+    summary_dir = model.log_dir if hvd.rank() == 0 else None
+    with tf.train.MonitoredTrainingSession(checkpoint_dir=checkpoint_dir,
+                                           summary_dir=summary_dir,
                                            config=config,
-                                           hooks=hooks) as sess:
+                                           hooks=hooks,
+                                           save_checkpoint_steps=args.checkpoint_steps) as sess:
         model.register_session(sess)
         model.train(d_op=d_op, g_op=g_op, input_handle=input_handle, loss_handle=loss_handle,
                     summary_handle=summary_handle, data_provider=data_provider,
