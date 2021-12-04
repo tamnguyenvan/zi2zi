@@ -2,18 +2,11 @@
 from __future__ import print_function
 from __future__ import absolute_import
 
-import os
-
-from model.dataset import TrainDataProvider
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
-if type(tf.contrib) != type(tf): tf.contrib._warning = None
 import argparse
-
-from model.unet import UNet
 import horovod.tensorflow as hvd
 
+from model.unet import UNet
 
 parser = argparse.ArgumentParser(description='Train')
 parser.add_argument('--experiment_dir', dest='experiment_dir', required=True,
@@ -31,7 +24,7 @@ parser.add_argument('--embedding_num', dest='embedding_num', type=int, default=4
                     help="number for distinct embeddings")
 parser.add_argument('--embedding_dim', dest='embedding_dim', type=int, default=128, help="dimension for embedding")
 parser.add_argument('--epoch', dest='epoch', type=int, default=100, help='number of epoch')
-parser.add_argument('--batch_size', dest='batch_size', type=int, default=16, help='number of examples in batch each process (CPU or GPU)')
+parser.add_argument('--batch_size', dest='batch_size', type=int, default=16, help='number of examples in batch')
 parser.add_argument('--lr', dest='lr', type=float, default=0.001, help='initial learning rate for adam')
 parser.add_argument('--schedule', dest='schedule', type=int, default=10, help='number of epochs to half learning rate')
 parser.add_argument('--resume', dest='resume', type=int, default=1, help='resume from previous training')
@@ -47,65 +40,44 @@ parser.add_argument('--checkpoint_steps', dest='checkpoint_steps', type=int, def
                     help='number of batches in between two checkpoints')
 parser.add_argument('--flip_labels', dest='flip_labels', type=int, default=None,
                     help='whether flip training data labels or not, in fine tuning')
+parser.add_argument('--seed', type=int, default=12, help='Random seed')
 args = parser.parse_args()
+
+
+def _print(*args, **kwargs):
+    if hvd.rank() == 0:
+        print(*args, **kwargs)
+
 
 def main(_):
     hvd.init()
+
+    # Init session and params
     config = tf.ConfigProto()
     config.gpu_options.allow_growth = True
+    # Pin GPU to local rank (one GPU per process)
     config.gpu_options.visible_device_list = str(hvd.local_rank())
+    sess = tf.Session(config=config)
+
+    tf.set_random_seed(hvd.rank() + hvd.size() * args.seed)
+
     model = UNet(args.experiment_dir, batch_size=args.batch_size, experiment_id=args.experiment_id,
                     input_width=args.image_size, output_width=args.image_size, embedding_num=args.embedding_num,
                     embedding_dim=args.embedding_dim, L1_penalty=args.L1_penalty, Lconst_penalty=args.Lconst_penalty,
                     Ltv_penalty=args.Ltv_penalty, Lcategory_penalty=args.Lcategory_penalty)
+    model.register_session(sess)
     if args.flip_labels:
         model.build_model(is_training=True, inst_norm=args.inst_norm, no_target_source=True)
     else:
         model.build_model(is_training=True, inst_norm=args.inst_norm)
-
-    # global_step = tf.train.get_or_create_global_step()
-    hooks = [
-        hvd.BroadcastGlobalVariablesHook(0),
-    ]
-
-    lr = args.lr
     fine_tune_list = None
     if args.fine_tune:
         ids = args.fine_tune.split(",")
         fine_tune_list = set([int(i) for i in ids])
-
-    # filter by one type of labels
-    data_provider = TrainDataProvider(model.data_dir, filter_by=fine_tune_list)
-    total_batches = data_provider.compute_total_batch_num(model.batch_size)
-    val_batch_iter = data_provider.get_val_iter(model.batch_size)
-
-    global_step = tf.train.get_or_create_global_step()
-    g_vars, d_vars = model.retrieve_trainable_vars(freeze_encoder=args.freeze_encoder)
-    input_handle, loss_handle, _, summary_handle = model.retrieve_handles()
-    learning_rate = tf.placeholder(tf.float32, name="learning_rate")
-    d_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5)
-    d_op = d_optimizer.minimize(loss_handle.d_loss, var_list=d_vars, global_step=global_step)
-    g_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5)
-    g_op = g_optimizer.minimize(loss_handle.g_loss, var_list=g_vars, global_step=global_step)
-
-    d_optimizer = hvd.DistributedOptimizer(d_optimizer)
-    g_optimizer = hvd.DistributedOptimizer(g_optimizer)
-
-    checkpoint_dir = model.checkpoint_dir if hvd.rank() == 0 else None
-    summary_dir = model.log_dir if hvd.rank() == 0 else None
-    with tf.train.MonitoredTrainingSession(checkpoint_dir=checkpoint_dir,
-                                           summary_dir=summary_dir,
-                                           config=config,
-                                           hooks=hooks,
-                                           save_checkpoint_steps=args.checkpoint_steps) as sess:
-        model.register_session(sess)
-        model.train(d_op=d_op, g_op=g_op, input_handle=input_handle, loss_handle=loss_handle,
-                    summary_handle=summary_handle, data_provider=data_provider,
-                    total_batches=total_batches, val_batch_iter=val_batch_iter, learning_rate=learning_rate,
-                    lr=args.lr, epoch=args.epoch, resume=args.resume,
-                    schedule=args.schedule, freeze_encoder=args.freeze_encoder, fine_tune=fine_tune_list,
-                    sample_steps=args.sample_steps, checkpoint_steps=args.checkpoint_steps,
-                    flip_labels=args.flip_labels)
+    model.train(lr=args.lr, epoch=args.epoch, resume=args.resume,
+                schedule=args.schedule, freeze_encoder=args.freeze_encoder, fine_tune=fine_tune_list,
+                sample_steps=args.sample_steps, checkpoint_steps=args.checkpoint_steps,
+                flip_labels=args.flip_labels)
 
 
 if __name__ == '__main__':

@@ -3,7 +3,6 @@ from __future__ import print_function
 from __future__ import absolute_import
 
 import tensorflow as tf
-import horovod.tensorflow as hvd
 import numpy as np
 import scipy.misc as misc
 import os
@@ -13,6 +12,8 @@ from .ops import conv2d, deconv2d, lrelu, fc, batch_norm, init_embedding, condit
 from .dataset import TrainDataProvider, InjectDataProvider, NeverEndingLoopingProvider
 from .utils import scale_back, merge, save_concat_images
 
+import horovod.tensorflow as hvd
+
 # Auxiliary wrapper classes
 # Used to save handles(important nodes in computation graph) for later evaluation
 LossHandle = namedtuple("LossHandle", ["d_loss", "g_loss", "const_loss", "l1_loss",
@@ -20,6 +21,11 @@ LossHandle = namedtuple("LossHandle", ["d_loss", "g_loss", "const_loss", "l1_los
 InputHandle = namedtuple("InputHandle", ["real_data", "embedding_ids", "no_target_data", "no_target_ids"])
 EvalHandle = namedtuple("EvalHandle", ["encoder", "generator", "target", "source", "embedding"])
 SummaryHandle = namedtuple("SummaryHandle", ["d_merged", "g_merged"])
+
+
+def _print(*args, **kwargs):
+    if hvd.rank() == 0:
+        print(*args, **kwargs)
 
 
 class UNet(object):
@@ -52,16 +58,13 @@ class UNet(object):
 
             if not os.path.exists(self.checkpoint_dir):
                 os.makedirs(self.checkpoint_dir)
-                if hvd.rank() == 0:
-                    print("create checkpoint directory")
+                _print("create checkpoint directory")
             if not os.path.exists(self.log_dir):
                 os.makedirs(self.log_dir)
-                if hvd.rank() == 0:
-                    print("create log directory")
+                _print("create log directory")
             if not os.path.exists(self.sample_dir):
                 os.makedirs(self.sample_dir)
-                if hvd.rank() == 0:
-                    print("create sample directory")
+                _print("create sample directory")
 
     def encoder(self, images, is_training, reuse=False):
         with tf.variable_scope("generator"):
@@ -309,8 +312,7 @@ class UNet(object):
 
         if freeze_encoder:
             # exclude encoder weights
-            if hvd.rank() == 0:
-                print("freeze encoder weights")
+            _print("freeze encoder weights")
             g_vars = [var for var in g_vars if not ("g_e" in var.name)]
 
         return g_vars, d_vars
@@ -348,11 +350,9 @@ class UNet(object):
 
         if ckpt:
             saver.restore(self.sess, ckpt.model_checkpoint_path)
-            if hvd.rank() == 0:
-                print("restored model %s" % model_dir)
+            _print("restored model %s" % model_dir)
         else:
-            if hvd.rank() == 0:
-                print("fail to restore model %s" % model_dir)
+            _print("fail to restore model %s" % model_dir)
 
     def generate_fake_samples(self, input_images, embedding_ids):
         input_handle, loss_handle, eval_handle, summary_handle = self.retrieve_handles()
@@ -373,8 +373,7 @@ class UNet(object):
     def validate_model(self, val_iter, epoch, step):
         labels, images = next(val_iter)
         fake_imgs, real_imgs, d_loss, g_loss, l1_loss = self.generate_fake_samples(images, labels)
-        if hvd.rank() == 0:
-            print("Sample: d_loss: %.5f, g_loss: %.5f, l1_loss: %.5f" % (d_loss, g_loss, l1_loss))
+        _print("Sample: d_loss: %.5f, g_loss: %.5f, l1_loss: %.5f" % (d_loss, g_loss, l1_loss))
 
         merged_fake_images = merge(scale_back(fake_imgs), [self.batch_size, 1])
         merged_real_images = merge(scale_back(real_imgs), [self.batch_size, 1])
@@ -412,8 +411,7 @@ class UNet(object):
         def save_imgs(imgs, count):
             p = os.path.join(save_dir, "inferred_%04d.png" % count)
             save_concat_images(imgs, img_path=p)
-            if hvd.rank() == 0:
-                print("generated images saved at %s" % p)
+            _print("generated images saved at %s" % p)
 
         count = 0
         batch_buffer = list()
@@ -471,16 +469,14 @@ class UNet(object):
             embedding_snapshot.append((e_var, val))
             t = _interpolate_tensor(val)
             op = tf.assign(e_var, t, validate_shape=False)
-            if hvd.rank() == 0:
-                print("overwrite %s tensor" % e_var.name, "old_shape ->", e_var.get_shape(), "new shape ->", t.shape)
+            _print("overwrite %s tensor" % e_var.name, "old_shape ->", e_var.get_shape(), "new shape ->", t.shape)
             self.sess.run(op)
 
         source_provider = InjectDataProvider(source_obj)
         input_handle, _, eval_handle, _ = self.retrieve_handles()
         for step_idx in range(len(alphas)):
             alpha = alphas[step_idx]
-            if hvd.rank() == 0:
-                print("interpolate %d -> %.4f + %d -> %.4f" % (between[0], 1. - alpha, between[1], alpha))
+            _print("interpolate %d -> %.4f + %d -> %.4f" % (between[0], 1. - alpha, between[1], alpha))
             source_iter = source_provider.get_single_embedding_iter(self.batch_size, 0)
             batch_buffer = list()
             count = 0
@@ -499,19 +495,22 @@ class UNet(object):
                                    os.path.join(save_dir, "frame_%02d_%02d_step_%02d.png" % (
                                        between[0], between[1], step_idx)))
         # restore the embedding variables
-        if hvd.rank() == 0:
-            print("restore embedding values")
+        _print("restore embedding values")
         for var, val in embedding_snapshot:
             op = tf.assign(var, val, validate_shape=False)
             self.sess.run(op)
 
-    def train(self, d_op, g_op, input_handle, loss_handle, summary_handle, data_provider,
-                    total_batches, val_batch_iter, learning_rate,
-              lr, epoch=100, schedule=10, resume=True, flip_labels=False,
+    def train(self, lr=0.0002, epoch=100, schedule=10, resume=True, flip_labels=False,
               freeze_encoder=False, fine_tune=None, sample_steps=50, checkpoint_steps=500):
+        g_vars, d_vars = self.retrieve_trainable_vars(freeze_encoder=freeze_encoder)
+        input_handle, loss_handle, _, summary_handle = self.retrieve_handles()
 
         if not self.sess:
             raise Exception("no session registered")
+
+        learning_rate = tf.placeholder(tf.float32, name="learning_rate")
+        d_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5).minimize(loss_handle.d_loss, var_list=d_vars)
+        g_optimizer = tf.train.AdamOptimizer(learning_rate * hvd.size(), beta1=0.5).minimize(loss_handle.g_loss, var_list=g_vars)
 
         # tf.global_variables_initializer().run()
         real_data = input_handle.real_data
@@ -519,93 +518,97 @@ class UNet(object):
         no_target_data = input_handle.no_target_data
         no_target_ids = input_handle.no_target_ids
 
-        # if hvd.rank() == 0:
-        #     saver = tf.train.Saver(max_to_keep=3)
-        #     summary_writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
+        # filter by one type of labels
+        data_provider = TrainDataProvider(self.data_dir, filter_by=fine_tune)
+        total_batches = data_provider.compute_total_batch_num(self.batch_size)
+        val_batch_iter = data_provider.get_val_iter(self.batch_size)
 
-        #     if resume:
-        #         _, model_dir = self.get_model_id_and_dir()
-        #         self.restore_model(saver, model_dir)
+        saver = tf.train.Saver(max_to_keep=3)
+        summary_writer = tf.summary.FileWriter(self.log_dir, self.sess.graph)
+
+        # Train
+        self.sess.run(tf.global_variables_initializer())
+        self.sess.run(hvd.broadcast_global_variables(0))
+        self.sess.graph.finalize()
+        if resume:
+            _, model_dir = self.get_model_id_and_dir()
+            self.restore_model(saver, model_dir)
 
         current_lr = lr
         counter = 0
         start_time = time.time()
 
-        while not self.sess.should_stop():
-            for ei in range(epoch):
-                train_batch_iter = data_provider.get_train_iter(self.batch_size)
+        for ei in range(epoch):
+            train_batch_iter = data_provider.get_train_iter(self.batch_size)
 
-                if (ei + 1) % schedule == 0:
-                    update_lr = current_lr / 2.0
-                    # minimum learning rate guarantee
-                    update_lr = max(update_lr, 0.0002)
-                    if hvd.rank() == 0:
-                        print("decay learning rate from %.5f to %.5f" % (current_lr, update_lr))
-                    current_lr = update_lr
+            if (ei + 1) % schedule == 0:
+                update_lr = current_lr / 2.0
+                # minimum learning rate guarantee
+                update_lr = max(update_lr, 0.0002)
+                _print("decay learning rate from %.5f to %.5f" % (current_lr, update_lr))
+                current_lr = update_lr
 
-                for bid, batch in enumerate(train_batch_iter):
-                    counter += 1
-                    labels, batch_images = batch
-                    shuffled_ids = labels[:]
-                    if flip_labels:
-                        np.random.shuffle(shuffled_ids)
-                    # Optimize D
-                    _, batch_d_loss, d_summary = self.sess.run([d_op, loss_handle.d_loss,
-                                                                summary_handle.d_merged],
-                                                            feed_dict={
-                                                                real_data: batch_images,
-                                                                embedding_ids: labels,
-                                                                learning_rate: current_lr,
-                                                                no_target_data: batch_images,
-                                                                no_target_ids: shuffled_ids
-                                                            })
-                    # Optimize G
-                    _, batch_g_loss = self.sess.run([g_op, loss_handle.g_loss],
-                                                    feed_dict={
-                                                        real_data: batch_images,
-                                                        embedding_ids: labels,
-                                                        learning_rate: current_lr,
-                                                        no_target_data: batch_images,
-                                                        no_target_ids: shuffled_ids
-                                                    })
-                    # magic move to Optimize G again
-                    # according to https://github.com/carpedm20/DCGAN-tensorflow
-                    # collect all the losses along the way
-                    _, batch_g_loss, category_loss, cheat_loss, \
-                    const_loss, l1_loss, tv_loss, g_summary = self.sess.run([g_op,
-                                                                            loss_handle.g_loss,
-                                                                            loss_handle.category_loss,
-                                                                            loss_handle.cheat_loss,
-                                                                            loss_handle.const_loss,
-                                                                            loss_handle.l1_loss,
-                                                                            loss_handle.tv_loss,
-                                                                            summary_handle.g_merged],
-                                                                            feed_dict={
-                                                                                real_data: batch_images,
-                                                                                embedding_ids: labels,
-                                                                                learning_rate: current_lr,
-                                                                                no_target_data: batch_images,
-                                                                                no_target_ids: shuffled_ids
-                                                                            })
-                    passed = time.time() - start_time
-                    if hvd.rank() == 0:
-                        log_format = "Epoch: [%2d], [%4d/%4d] time: %4.4f, d_loss: %.5f, g_loss: %.5f, " + \
-                                    "category_loss: %.5f, cheat_loss: %.5f, const_loss: %.5f, l1_loss: %.5f, tv_loss: %.5f"
-                        print(log_format % (ei, bid, total_batches, passed, batch_d_loss, batch_g_loss,
-                                            category_loss, cheat_loss, const_loss, l1_loss, tv_loss))
-                        # summary_writer.add_summary(d_summary, counter)
-                        # summary_writer.add_summary(g_summary, counter)
+            for bid, batch in enumerate(train_batch_iter):
+                counter += 1
+                labels, batch_images = batch
+                shuffled_ids = labels[:]
+                if flip_labels:
+                    np.random.shuffle(shuffled_ids)
+                # Optimize D
+                _, batch_d_loss, d_summary = self.sess.run([d_optimizer, loss_handle.d_loss,
+                                                            summary_handle.d_merged],
+                                                           feed_dict={
+                                                               real_data: batch_images,
+                                                               embedding_ids: labels,
+                                                               learning_rate: current_lr,
+                                                               no_target_data: batch_images,
+                                                               no_target_ids: shuffled_ids
+                                                           })
+                # Optimize G
+                _, batch_g_loss = self.sess.run([g_optimizer, loss_handle.g_loss],
+                                                feed_dict={
+                                                    real_data: batch_images,
+                                                    embedding_ids: labels,
+                                                    learning_rate: current_lr,
+                                                    no_target_data: batch_images,
+                                                    no_target_ids: shuffled_ids
+                                                })
+                # magic move to Optimize G again
+                # according to https://github.com/carpedm20/DCGAN-tensorflow
+                # collect all the losses along the way
+                _, batch_g_loss, category_loss, cheat_loss, \
+                const_loss, l1_loss, tv_loss, g_summary = self.sess.run([g_optimizer,
+                                                                         loss_handle.g_loss,
+                                                                         loss_handle.category_loss,
+                                                                         loss_handle.cheat_loss,
+                                                                         loss_handle.const_loss,
+                                                                         loss_handle.l1_loss,
+                                                                         loss_handle.tv_loss,
+                                                                         summary_handle.g_merged],
+                                                                        feed_dict={
+                                                                            real_data: batch_images,
+                                                                            embedding_ids: labels,
+                                                                            learning_rate: current_lr,
+                                                                            no_target_data: batch_images,
+                                                                            no_target_ids: shuffled_ids
+                                                                        })
+                passed = time.time() - start_time
+                log_format = "Epoch: [%2d], [%4d/%4d] time: %4.4f, d_loss: %.5f, g_loss: %.5f, " + \
+                             "category_loss: %.5f, cheat_loss: %.5f, const_loss: %.5f, l1_loss: %.5f, tv_loss: %.5f"
+                _print(log_format % (ei, bid, total_batches, passed, batch_d_loss, batch_g_loss,
+                                    category_loss, cheat_loss, const_loss, l1_loss, tv_loss))
+                if hvd.rank() == 0:
+                    summary_writer.add_summary(d_summary, counter)
+                    summary_writer.add_summary(g_summary, counter)
 
                     if counter % sample_steps == 0:
                         # sample the current model states with val data
-                        if hvd.rank() == 0:
-                            self.validate_model(val_batch_iter, ei, counter)
+                        self.validate_model(val_batch_iter, ei, counter)
 
-                    # if counter % checkpoint_steps == 0:
-                    #     if hvd.rankd() == 0:
-                    #         print("Checkpoint: save checkpoint step %d" % counter)
-                    #         self.checkpoint(saver, counter)
-            # save the last checkpoint
-            # if hvd.rank() == 0:
-            #     print("Checkpoint: last checkpoint step %d" % counter)
-            #     self.checkpoint(saver, counter)
+                    if counter % checkpoint_steps == 0:
+                        _print("Checkpoint: save checkpoint step %d" % counter)
+                        self.checkpoint(saver, counter)
+        # save the last checkpoint
+        if hvd.rank() == 0:
+            _print("Checkpoint: last checkpoint step %d" % counter)
+            self.checkpoint(saver, counter)
